@@ -23,10 +23,12 @@ from pins import fetch_extras, technical_pins  # noqa: E402
 from scoring import (agreement, explain, indicators, rating_for,  # noqa: E402
                      rating_for_pct, score_frame, trade_plan)
 from universe import load_universe  # noqa: E402
+from market import build_market  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "web", "data")
-CHART_DAYS = 252
+CHART_DAYS = 252   # track-record window
+BAR_DAYS = 504     # 2 years of bars per chart (EMA 200 needs the warm-up)
 FWD = 20  # track-record horizon in sessions (~1 month swing)
 
 
@@ -49,7 +51,7 @@ def dump(path, obj):
 def download(symbols):
     print(f"[prices] downloading {len(symbols)} symbols ...")
     t0 = time.time()
-    data = yf.download(symbols, period="2y", interval="1d", auto_adjust=True,
+    data = yf.download(symbols, period="5y", interval="1d", auto_adjust=True,
                        group_by="ticker", threads=True, progress=False)
     # Retry anything that failed (Yahoo hiccups, cache locks) one at a time
     missing = [s for s in symbols if get_frame(data, s) is None]
@@ -58,7 +60,7 @@ def download(symbols):
         frames = {s: data[s] for s in symbols if s not in missing and s in data.columns.get_level_values(0)}
         for s in missing:
             time.sleep(0.5)
-            one = yf.download(s, period="2y", interval="1d", auto_adjust=True,
+            one = yf.download(s, period="5y", interval="1d", auto_adjust=True,
                               group_by="ticker", threads=False, progress=False)
             if one is not None and len(one):
                 frames[s] = one[s] if isinstance(one.columns, pd.MultiIndex) else one
@@ -152,13 +154,13 @@ def main():
             e_days = int(np.busday_count(last_date.date(), pd.Timestamp(next_e).date()))
 
         # --- per-ticker chart file
-        tail = ind.iloc[-CHART_DAYS:]
-        sc_tail = score.iloc[-CHART_DAYS:]
+        tail = ind.iloc[-BAR_DAYS:]
+        sc_tail = score.iloc[-BAR_DAYS:]
         first_chart_day = tail.index[0].strftime("%Y-%m-%d")
         if sym == "SPY":
-            pins = technical_pins(ind, score, ratings, score / 100, 0.62, 0.39, 0.50, CHART_DAYS)
+            pins = technical_pins(ind, score, ratings, score / 100, 0.62, 0.39, 0.50, BAR_DAYS)
         else:
-            pins = technical_pins(ind, score, ratings, pct_panel[sym], 0.70, 0.30, 0.50, CHART_DAYS)
+            pins = technical_pins(ind, score, ratings, pct_panel[sym], 0.70, 0.30, 0.50, BAR_DAYS)
         pins += [p for p in ex.get("earnings", []) if p["date"] >= first_chart_day]
         pins += [p for p in ex.get("news", []) if p["date"] >= first_chart_day]
         pins.sort(key=lambda p: p["date"])
@@ -182,7 +184,7 @@ def main():
             sym=sym, name=name, sector=sector, industry=industry, asOf=last_date.strftime("%Y-%m-%d"),
             bars=[[d.strftime("%Y-%m-%d"), r2(o), r2(h), r2(l), r2(cl), int(v) if not pd.isna(v) else 0]
                   for d, o, h, l, cl, v in zip(tail.index, tail.open, tail.high, tail.low, tail.close, tail.volume)],
-            sma50=[r2(x) for x in tail.sma50], sma200=[r2(x) for x in tail.sma200],
+            # moving averages, bands, RSI, MACD are computed in the browser from bars
             score=[r2(x, 0) for x in sc_tail],
             latest=dict(score=s_now, rating=rating, rank=rank, agree=agree, active=active, agents=agents, plan=plan,
                         nextEarnings=next_e, earningsDays=e_days),
@@ -241,6 +243,17 @@ def main():
         stocks=stocks,
     )
     dump(os.path.join(OUT, "summary.json"), summary)
+
+    # Broad market (index stats, index charts, fear & greed) in its own file
+    try:
+        mk = build_market(closes)
+        mk["generatedAt"] = summary["generatedAt"]
+        dump(os.path.join(OUT, "market.json"), mk)
+        fg = mk.get("fearGreed") or {}
+        print(f"[market] fear & greed {fg.get('value')} ({fg.get('label')}); "
+              f"crypto {(mk.get('cryptoFearGreed') or {}).get('value')}")
+    except Exception as exc:
+        print(f"[market] failed: {exc}")
     print(f"[done] {len(stocks)} stocks scored, as of {summary['asOf']}. Counts: {counts}")
     print("[track]", track)
 

@@ -1,4 +1,6 @@
 // Tickmark — swing-trading research desk (static app, data from data/*.json)
+import { fearGreedRow, marketCards, statPills, bindMarketCards, viewFear } from './market.js';
+import { sma, ema, bollinger, rsi, macd, supportResistance } from './indicators.js';
 
 const view = document.getElementById('view');
 const LC = window.LightweightCharts;
@@ -20,6 +22,7 @@ const disclaimer = () => `<p class="disclaimer">Educational research tool, not i
 const COLORS = { bull: '#34d399', bear: '#f87171', neutral: '#8b98a8', news: '#a78bfa', earnings: '#fbbf24', accent: '#5eead4' };
 
 let S = null;
+let M = null; // broad market + fear & greed (optional)
 const tickCache = new Map();
 let disposers = [];
 
@@ -33,6 +36,10 @@ async function loadSummary() {
   document.getElementById('asof').textContent = `Close ${S.asOf}`;
   document.getElementById('tickers').innerHTML = Object.values(S.bySym)
     .map((s) => `<option value="${esc(s.sym)}">${esc(s.name)}</option>`).join('');
+  try {
+    const m = await fetch('data/market.json', { cache: 'no-cache' });
+    if (m.ok) M = await m.json();
+  } catch { /* market header is optional */ }
 }
 
 async function loadTicker(sym) {
@@ -50,7 +57,10 @@ function route() {
   disposers = [];
   const [r, arg] = (location.hash.replace(/^#\/?/, '') || 'today').split('/');
   document.querySelectorAll('#nav a').forEach((a) => a.classList.toggle('on', a.dataset.r === r));
-  const views = { today: viewToday, best: viewBest, screener: viewScreener, t: () => viewTicker(arg || 'SPY'), record: viewRecord };
+  const views = {
+    today: viewToday, best: viewBest, screener: viewScreener, t: () => viewTicker(arg || 'SPY'), record: viewRecord,
+    fear: () => (M ? viewFear(view, M, LC, arg, disposers) : (view.innerHTML = '<p class="sub">Market data not available yet.</p>')),
+  };
   (views[r] || viewToday)();
   window.scrollTo(0, 0);
 }
@@ -132,8 +142,12 @@ function viewToday() {
   view.innerHTML = `
     <h1>Market today</h1>
     <p class="sub">Daily close ${esc(S.asOf)} · each stock is rated against the rest of the S&amp;P 500</p>
+    ${fearGreedRow(M)}
+    ${marketCards(M)}
+    ${statPills(M, S.stocks)}
+    <h2>Breadth</h2>
     <div class="grid g4">
-      <a class="card stat" href="#/t/SPY"><div class="k">S&amp;P 500 (SPY)</div><div class="v num">${fmt(spy.close)}</div><div class="s num ${updown(spy.chg1d)}">${pct(spy.chg1d)} today · ${pct(spy.chg5d)} 5d</div></a>
+      <a class="card stat" href="#/t/SPY"><div class="k">SPY agent rating</div><div class="v">${chip(spy.rating)}</div><div class="s">score ${spy.score ?? '—'} · ${pct(spy.chg5d)} 5d</div></a>
       <div class="card stat"><div class="k">Above 50-day avg</div><div class="v num">${m.above50}%</div><div class="s">short-term breadth</div></div>
       <div class="card stat"><div class="k">Above 200-day avg</div><div class="v num">${m.above200}%</div><div class="s">long-term breadth</div></div>
       <div class="card stat"><div class="k">Advancers / decliners</div><div class="v num"><span class="up">${m.up}</span> / <span class="down">${m.down}</span></div><div class="s">today</div></div>
@@ -158,6 +172,7 @@ function viewToday() {
         <div class="rows">${earn.slice(0, 15).map((s) => row(s, `<span class="chip warn">${s.earningsDays === 0 ? 'today' : s.earningsDays + 'd'}</span>`)).join('') || '<p class="empty">None found.</p>'}</div></div>
     </div>
     ${disclaimer()}`;
+  bindMarketCards(viewToday);
 }
 
 function viewBest() {
@@ -349,10 +364,10 @@ async function viewTicker(symRaw) {
       <div>
         <div class="card" style="padding:8px">
           <div class="chart-wrap"><div class="legend" id="legend"></div><div id="chart"></div></div>
-          <div class="score-label">Agent score history (above 50 = more bullish votes)</div>
-          <div id="scorechart"></div>
+          <div id="panes"></div>
         </div>
-        <div class="pin-toggles">${Object.entries(PIN_TYPES).map(([k, v]) => `<button class="toggle ${enabled[k] ? 'on' : ''}" data-pt="${k}"><i style="background:${v.color}"></i>${v.label}</button>`).join('')}</div>
+        <div class="pin-toggles" id="indtoggles"></div>
+        <div class="pin-toggles"><span class="muted" style="font-size:12px;align-self:center">Pins</span>${Object.entries(PIN_TYPES).map(([k, v]) => `<button class="toggle ${enabled[k] ? 'on' : ''}" data-pt="${k}"><i style="background:${v.color}"></i>${v.label}</button>`).join('')}</div>
         <div id="pincard"><p class="muted" style="font-size:13px;margin:0">Tap a marker on the chart, or an item below, to see what happened.</p></div>
         <div class="section"><h2>Timeline</h2><div class="card timeline" id="timeline"></div></div>
       </div>
@@ -384,59 +399,134 @@ async function viewTicker(symRaw) {
 
   if (!LC) { document.getElementById('chart').innerHTML = '<p class="empty">Chart library failed to load (offline?).</p>'; return; }
 
-  // --- main chart
+  // --- indicator settings (remembered per device)
+  const IND = {
+    sr: 'Support / resistance', ema: 'EMA 20/50/100/200', sma: 'SMA 50/200', bb: 'Bollinger Bands',
+    vol: 'Volume', plan: 'Stop / target', score: 'Agent score', rsi: 'RSI', macd: 'MACD',
+  };
+  const on = { sr: true, ema: true, sma: false, bb: false, vol: true, plan: true, score: true, rsi: true, macd: false, ...store.get('ind', {}) };
+  document.getElementById('indtoggles').innerHTML = `<span class="muted" style="font-size:12px;align-self:center">Indicators</span>`
+    + Object.entries(IND).map(([k, v]) => `<button class="toggle ${on[k] ? 'on' : ''}" data-ind="${k}">${v}</button>`).join('');
+
   const base = {
     autoSize: true,
     layout: { background: { type: 'solid', color: 'transparent' }, textColor: '#8b98a8', fontFamily: 'system-ui, sans-serif' },
     grid: { vertLines: { color: 'rgba(39,49,64,.45)' }, horzLines: { color: 'rgba(39,49,64,.45)' } },
-    rightPriceScale: { borderColor: '#273140', minimumWidth: 64 },
+    rightPriceScale: { borderColor: '#273140', minimumWidth: 70 },
     timeScale: { borderColor: '#273140', rightOffset: 3 },
     crosshair: { mode: LC.CrosshairMode.Normal },
     // let the page scroll vertically on phones; horizontal drag pans the chart
     handleScroll: { mouseWheel: true, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: false },
   };
   const bars = T.bars;
+  const n = bars.length;
   const dates = bars.map((b) => b[0]);
   const idxOf = new Map(dates.map((d, k) => [d, k]));
-  const chart = LC.createChart(document.getElementById('chart'), base);
-  disposers.push(() => chart.remove());
-  const candles = chart.addCandlestickSeries({ upColor: COLORS.bull, downColor: COLORS.bear, borderVisible: false, wickUpColor: COLORS.bull, wickDownColor: COLORS.bear });
-  candles.priceScale().applyOptions({ scaleMargins: { top: 0.08, bottom: 0.22 } });
-  candles.setData(bars.map((b) => ({ time: b[0], open: b[1], high: b[2], low: b[3], close: b[4] })));
-  const vol = chart.addHistogramSeries({ priceScaleId: 'vol', priceFormat: { type: 'volume' }, lastValueVisible: false, priceLineVisible: false });
-  chart.priceScale('vol').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
-  vol.setData(bars.map((b, k) => ({ time: b[0], value: b[5], color: k && b[4] < bars[k - 1][4] ? 'rgba(248,113,113,.35)' : 'rgba(52,211,153,.35)' })));
-  const line = (arr, color) => {
-    const ser = chart.addLineSeries({ color, lineWidth: 1.5, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false });
-    ser.setData(arr.map((v, k) => (v == null ? { time: dates[k] } : { time: dates[k], value: v })));
+  const closes = bars.map((b) => b[4]);
+  const rsiArr = rsi(closes);
+  const rsiStart = rsiArr.findIndex((x) => x != null);
+  const rsiMa = rsiArr.map((_, i) => (i - rsiStart >= 13 ? rsiArr.slice(i - 13, i + 1).reduce((a, b) => a + b, 0) / 14 : null));
+  const calc = {
+    ema20: ema(closes, 20), ema50: ema(closes, 50), ema100: ema(closes, 100), ema200: ema(closes, 200),
+    sma50: sma(closes, 50), sma200: sma(closes, 200), bb: bollinger(closes), rsi: rsiArr, rsiMa,
+    macd: macd(closes), sr: supportResistance(bars),
   };
-  line(T.sma50, '#60a5fa');
-  line(T.sma200, '#fbbf24');
-  const p = T.latest.plan;
-  candles.createPriceLine({ price: p.stop, color: COLORS.bear, lineWidth: 1, lineStyle: LC.LineStyle.Dashed, axisLabelVisible: true, title: 'stop' });
-  candles.createPriceLine({ price: p.target, color: COLORS.bull, lineWidth: 1, lineStyle: LC.LineStyle.Dashed, axisLabelVisible: true, title: 'target' });
+  const EMA_C = { ema20: '#f23645', ema50: '#ff9800', ema100: '#22d3ee', ema200: '#3b5bfd' };
+  const SMA_C = { sma50: '#60a5fa', sma200: '#fbbf24' };
+  const toLine = (arr) => arr.map((v, k) => (v == null ? { time: dates[k] } : { time: dates[k], value: v }));
+  const addLine = (ch, arr, color, extra = {}) => {
+    const s = ch.addLineSeries({ color, lineWidth: 1.5, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, ...extra });
+    s.setData(toLine(arr));
+    return s;
+  };
 
-  // --- score chart (synced)
-  const sc = LC.createChart(document.getElementById('scorechart'), { ...base, layout: { ...base.layout, attributionLogo: false }, rightPriceScale: { ...base.rightPriceScale, scaleMargins: { top: 0.1, bottom: 0.1 } }, timeScale: { ...base.timeScale, visible: false }, handleScroll: false, handleScale: false });
-  disposers.push(() => sc.remove());
-  const scoreSer = sc.addBaselineSeries({ baseValue: { type: 'price', price: 50 }, topLineColor: COLORS.bull, topFillColor1: 'rgba(52,211,153,.25)', topFillColor2: 'rgba(52,211,153,.02)', bottomLineColor: COLORS.bear, bottomFillColor1: 'rgba(248,113,113,.02)', bottomFillColor2: 'rgba(248,113,113,.25)', lineWidth: 2, priceLineVisible: false });
-  scoreSer.setData(T.score.map((v, k) => (v == null ? { time: dates[k] } : { time: dates[k], value: v })));
-  chart.timeScale().subscribeVisibleLogicalRangeChange((r) => { if (r) sc.timeScale().setVisibleLogicalRange(r); });
-  const n = bars.length;
-  chart.timeScale().setVisibleLogicalRange({ from: Math.max(0, n - 130), to: n + 2 });
-
-  // --- legend
+  let main = null; let candles = null; let charts = [];
   const legend = document.getElementById('legend');
+  const v2 = (x) => (x == null ? '—' : fmt(x));
   const showLegend = (k) => {
     const b = bars[k];
     if (!b) return;
-    legend.innerHTML = `${b[0]} O ${fmt(b[1])} H ${fmt(b[2])} L ${fmt(b[3])} C <span style="color:var(--text)">${fmt(b[4])}</span> · score ${T.score[k] ?? '—'} · <span style="color:#60a5fa">50d</span> <span style="color:#fbbf24">200d</span>`;
+    let h = `<div>${b[0]} O ${fmt(b[1])} H ${fmt(b[2])} L ${fmt(b[3])} C <span style="color:var(--text)">${fmt(b[4])}</span></div>`;
+    if (on.ema) h += `<div>EMA 20/50/100/200 ${['ema20', 'ema50', 'ema100', 'ema200'].map((e) => `<span style="color:${EMA_C[e]}">${v2(calc[e][k])}</span>`).join(' ')}</div>`;
+    if (on.sma) h += `<div>SMA 50/200 <span style="color:${SMA_C.sma50}">${v2(calc.sma50[k])}</span> <span style="color:${SMA_C.sma200}">${v2(calc.sma200[k])}</span></div>`;
+    if (on.bb) h += `<div>BB 20,2 <span style="color:#94a3b8">${v2(calc.bb.up[k])} / ${v2(calc.bb.lo[k])}</span></div>`;
+    legend.innerHTML = h;
+    document.querySelectorAll('[data-pane-val]').forEach((el) => {
+      const key = el.dataset.paneVal;
+      const f = (x) => (x == null ? '—' : x.toFixed(2));
+      if (key === 'score') el.textContent = T.score[k] ?? '—';
+      if (key === 'rsi') el.innerHTML = `<span style="color:#a78bfa">${f(calc.rsi[k])}</span> <span style="color:#fbbf24">${f(calc.rsiMa[k])}</span>`;
+      if (key === 'macd') el.innerHTML = `<span style="color:#60a5fa">${f(calc.macd.line[k])}</span> <span style="color:#ff9800">${f(calc.macd.signal[k])}</span>`;
+    });
   };
-  showLegend(n - 1);
-  chart.subscribeCrosshairMove((param) => {
-    const k = param.time ? idxOf.get(timeStr(param.time)) : undefined;
-    showLegend(k ?? n - 1);
-  });
+
+  const paneOpts = { ...base, layout: { ...base.layout, attributionLogo: false }, rightPriceScale: { ...base.rightPriceScale, scaleMargins: { top: 0.12, bottom: 0.08 } }, timeScale: { ...base.timeScale, visible: false }, handleScroll: false, handleScale: false };
+  const build = () => {
+    const keep = main ? main.timeScale().getVisibleLogicalRange() : null;
+    charts.forEach((c) => c.remove());
+    charts = [];
+
+    main = LC.createChart(document.getElementById('chart'), base);
+    charts.push(main);
+    candles = main.addCandlestickSeries({ upColor: COLORS.bull, downColor: COLORS.bear, borderVisible: false, wickUpColor: COLORS.bull, wickDownColor: COLORS.bear });
+    candles.priceScale().applyOptions({ scaleMargins: { top: 0.06, bottom: on.vol ? 0.2 : 0.06 } });
+    candles.setData(bars.map((b) => ({ time: b[0], open: b[1], high: b[2], low: b[3], close: b[4] })));
+    if (on.vol) {
+      const vol = main.addHistogramSeries({ priceScaleId: 'vol', priceFormat: { type: 'volume' }, lastValueVisible: false, priceLineVisible: false });
+      main.priceScale('vol').applyOptions({ scaleMargins: { top: 0.84, bottom: 0 } });
+      vol.setData(bars.map((b, k) => ({ time: b[0], value: b[5], color: k && b[4] < bars[k - 1][4] ? 'rgba(248,113,113,.35)' : 'rgba(52,211,153,.35)' })));
+    }
+    if (on.bb) {
+      addLine(main, calc.bb.up, 'rgba(148,163,184,.8)', { lineWidth: 1 });
+      addLine(main, calc.bb.lo, 'rgba(148,163,184,.8)', { lineWidth: 1 });
+      addLine(main, calc.bb.mid, 'rgba(148,163,184,.5)', { lineWidth: 1, lineStyle: LC.LineStyle.Dashed });
+    }
+    if (on.ema) Object.entries(EMA_C).forEach(([k, c]) => addLine(main, calc[k], c));
+    if (on.sma) Object.entries(SMA_C).forEach(([k, c]) => addLine(main, calc[k], c, { lineStyle: LC.LineStyle.Dashed }));
+    if (on.sr) {
+      calc.sr.forEach((l) => candles.createPriceLine({ price: l.price, color: 'rgba(227,200,75,.85)', lineWidth: 1, lineStyle: LC.LineStyle.Solid, axisLabelVisible: true, axisLabelColor: '#e3c84b', axisLabelTextColor: '#111', title: '' }));
+    }
+    if (on.plan) {
+      const p = T.latest.plan;
+      candles.createPriceLine({ price: p.stop, color: COLORS.bear, lineWidth: 1, lineStyle: LC.LineStyle.Dashed, axisLabelVisible: true, title: 'stop' });
+      candles.createPriceLine({ price: p.target, color: COLORS.bull, lineWidth: 1, lineStyle: LC.LineStyle.Dashed, axisLabelVisible: true, title: 'target' });
+    }
+
+    // --- lower panes
+    const panesEl = document.getElementById('panes');
+    const wanted = [['score', 'Agent score', 90], ['rsi', 'RSI 14', 110], ['macd', 'MACD 12,26,9', 110]].filter(([k]) => on[k]);
+    panesEl.innerHTML = wanted.map(([k, label, h]) => `<div class="pane"><div class="pane-label">${label} <span data-pane-val="${k}"></span></div><div id="pane-${k}" style="height:${h}px"></div></div>`).join('');
+    const panes = [];
+    wanted.forEach(([k]) => {
+      const ch = LC.createChart(document.getElementById(`pane-${k}`), paneOpts);
+      charts.push(ch); panes.push(ch);
+      if (k === 'score') {
+        const s = ch.addBaselineSeries({ baseValue: { type: 'price', price: 50 }, topLineColor: COLORS.bull, topFillColor1: 'rgba(52,211,153,.25)', topFillColor2: 'rgba(52,211,153,.02)', bottomLineColor: COLORS.bear, bottomFillColor1: 'rgba(248,113,113,.02)', bottomFillColor2: 'rgba(248,113,113,.25)', lineWidth: 2, priceLineVisible: false });
+        s.setData(toLine(T.score));
+      }
+      if (k === 'rsi') {
+        const s = addLine(ch, calc.rsi, '#a78bfa', { autoscaleInfoProvider: () => ({ priceRange: { minValue: 10, maxValue: 90 } }) });
+        addLine(ch, calc.rsiMa, '#fbbf24', { lineWidth: 1 });
+        [[70, 'Dashed'], [50, 'Dotted'], [30, 'Dashed']].forEach(([p, st]) => s.createPriceLine({ price: p, color: 'rgba(139,152,168,.6)', lineWidth: 1, lineStyle: LC.LineStyle[st], axisLabelVisible: false }));
+      }
+      if (k === 'macd') {
+        const hst = ch.addHistogramSeries({ priceLineVisible: false, lastValueVisible: false });
+        hst.setData(calc.macd.hist.map((v, i) => (v == null ? { time: dates[i] } : { time: dates[i], value: v, color: v >= 0 ? 'rgba(52,211,153,.55)' : 'rgba(248,113,113,.55)' })));
+        addLine(ch, calc.macd.line, '#60a5fa');
+        addLine(ch, calc.macd.signal, '#ff9800');
+      }
+    });
+    main.timeScale().subscribeVisibleLogicalRangeChange((r) => { if (r) panes.forEach((p) => p.timeScale().setVisibleLogicalRange(r)); });
+    main.timeScale().setVisibleLogicalRange(keep || { from: Math.max(0, n - 130), to: n + 2 });
+    showLegend(n - 1);
+    main.subscribeCrosshairMove((param) => {
+      const k = param.time ? idxOf.get(timeStr(param.time)) : undefined;
+      showLegend(k ?? n - 1);
+    });
+    main.subscribeClick(onChartClick);
+    drawPins();
+  };
+  disposers.push(() => charts.forEach((c) => c.remove()));
 
   // --- pins
   const snap = (d) => {
@@ -446,13 +536,13 @@ async function viewTicker(symRaw) {
     while (lo < hi) { const mid = (lo + hi) >> 1; if (dates[mid] < d) lo = mid + 1; else hi = mid; }
     return lo;
   };
-  const pins = T.pins.map((pin) => ({ ...pin, idx: snap(pin.date) }));
+  const pins = T.pins.filter((pin) => pin.date >= dates[0]).map((pin) => ({ ...pin, idx: snap(pin.date) }));
   const pinCardEl = document.getElementById('pincard');
   const showPins = (list) => { pinCardEl.innerHTML = list.map(pinCard).join(''); };
   const focus = (idx) => {
-    chart.timeScale().setVisibleLogicalRange({ from: Math.max(0, idx - 70), to: Math.min(n + 2, idx + 30) });
+    main.timeScale().setVisibleLogicalRange({ from: Math.max(0, idx - 70), to: Math.min(n + 2, idx + 30) });
   };
-  const drawPins = () => {
+  function drawPins() {
     const vis = pins.filter((pin) => enabled[pin.type]);
     candles.setMarkers(vis.map((pin) => marker(pin, dates[pin.idx])).sort((a, b) => (a.time < b.time ? -1 : a.time > b.time ? 1 : 0)));
     const tl = document.getElementById('timeline');
@@ -467,21 +557,28 @@ async function viewTicker(symRaw) {
       focus(pin.idx);
       pinCardEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
     };
-  };
-  drawPins();
-  chart.subscribeClick((param) => {
+  }
+  function onChartClick(param) {
     if (!param.time) return;
     const k = idxOf.get(timeStr(param.time));
     const vis = pins.filter((pin) => enabled[pin.type]);
     let hit = vis.filter((pin) => pin.idx === k);
     if (!hit.length) hit = vis.filter((pin) => Math.abs(pin.idx - k) <= 1);
     if (hit.length) showPins(hit);
-  });
+  }
+  build();
+
   view.querySelectorAll('[data-pt]').forEach((b) => b.addEventListener('click', () => {
     enabled[b.dataset.pt] = !enabled[b.dataset.pt];
     store.set('pinTypes', enabled);
     b.classList.toggle('on', enabled[b.dataset.pt]);
     drawPins();
+  }));
+  view.querySelectorAll('[data-ind]').forEach((b) => b.addEventListener('click', () => {
+    on[b.dataset.ind] = !on[b.dataset.ind];
+    store.set('ind', on);
+    b.classList.toggle('on', on[b.dataset.ind]);
+    build();
   }));
 }
 

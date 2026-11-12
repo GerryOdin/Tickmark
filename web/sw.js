@@ -1,7 +1,7 @@
 // Offline support: app shell cached; data is network-first (falls back to last copy).
-const SHELL = 'tickmark-shell-v1';
-const DATA = 'tickmark-data-v1';
-const SHELL_FILES = ['./', 'index.html', 'styles.css', 'app.js', 'manifest.webmanifest', 'icons/icon.svg',
+const SHELL = 'tickmark-shell-v2';
+const DATA = 'tickmark-data-v2';
+const SHELL_FILES = ['./', 'index.html', 'styles.css', 'app.js', 'market.js', 'indicators.js', 'manifest.webmanifest', 'icons/icon.svg',
   'https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js'];
 
 self.addEventListener('install', (e) => {
