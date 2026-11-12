@@ -5,6 +5,8 @@ on:
   schedule:
     - cron: "45 21 * * 1-5"   # 21:45 UTC = 4:45 pm ET (winter) / 5:45 pm ET (summer)
   workflow_dispatch: {}        # "Run workflow" button for manual runs
+  push:
+    branches: [main]           # rebuild whenever new code is uploaded
 
 permissions:
   contents: read
