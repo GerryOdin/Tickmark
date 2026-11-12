@@ -1,0 +1,7 @@
+# Generated nightly by the pipeline; not stored in git
+web/data/
+__pycache__/
+*.pyc
+.venv/
+# local-only settings (contain PC-specific paths)
+.claude/
